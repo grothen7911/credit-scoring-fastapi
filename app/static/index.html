@@ -5,24 +5,31 @@
   <title>Demo Scoring Crédit</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
     fieldset { border: 1px solid #ddd; padding: 1rem; margin-bottom: 1rem; }
-    label { display:block; margin: .3rem 0 .1rem; font-weight:600 }
+    label { display:block; margin: .35rem 0 .15rem; font-weight:600 }
     input, select { width: 100%; padding: .45rem; margin-bottom: .5rem; }
     .row { display:grid; grid-template-columns: repeat(2,1fr); gap: 1rem; }
     .result { padding: 1rem; border: 1px solid #eee; background: #fafafa; }
     .badge { display:inline-block; padding:.2rem .5rem; border-radius:6px; }
     .ok { background:#e6ffed; border:1px solid #b7f5c4; }
     .ko { background:#ffecec; border:1px solid #ffc9c9; }
-    code { background:#f6f8fa; padding:.1rem .3rem; border-radius:4px; }
+    .muted { color:#666; font-size:.95rem }
+    .error { color:#b00020; white-space:pre-wrap }
+    .toolbar { display:flex; gap:.5rem; margin:.75rem 0 1rem }
   </style>
 </head>
 <body>
   <h1>Scoring de crédit (demo)</h1>
-  <p>Remplis les champs puis clique sur <b>Évaluer</b>. Le seuil se configure côté serveur via <code>THRESHOLD</code>.</p>
+  <p class="muted">Saisis les champs puis clique <b>Évaluer</b>. Le seuil se règle côté serveur via <code>THRESHOLD</code>.</p>
+
+  <div class="toolbar">
+    <button id="btn-fill">Remplir un exemple (ACCEPT)</button>
+    <button id="btn-eval">Évaluer</button>
+    <span id="status" class="muted"></span>
+  </div>
 
   <div id="form"></div>
-  <button id="btn">Évaluer</button>
 
   <h2>Résultat</h2>
   <div id="out" class="result">—</div>
@@ -30,58 +37,133 @@
   <script>
     const out = document.getElementById('out');
     const formDiv = document.getElementById('form');
-    const btn = document.getElementById('btn');
+    const btnEval = document.getElementById('btn-eval');
+    const btnFill = document.getElementById('btn-fill');
+    const statusEl = document.getElementById('status');
 
-    // 1) Récupère la liste des features depuis l’API
     let features = [];
     let lexicon = {};
-    fetch('/version').then(r=>r.json()).then(meta => {
-      features = meta.features;
+    let inputsMap = {}; // name -> input element
+
+    function setStatus(msg){ statusEl.textContent = msg || ""; }
+
+    async function safeFetchJSON(url, options){
+      try{
+        const res = await fetch(url, options);
+        const text = await res.text();
+        let data;
+        try { data = JSON.parse(text); } catch(e){ data = { raw: text }; }
+        return { ok: res.ok, status: res.status, data };
+      }catch(err){
+        return { ok: false, status: 0, data: { error: String(err) } };
+      }
+    }
+
+    function buildForm(meta){
+      features = meta.features || [];
       lexicon = meta.lexicon || {};
-      // construit un mini formulaire auto à partir des features
       const groups = document.createElement('div'); groups.className = 'row';
+      inputsMap = {};
       features.forEach(f => {
         const label = document.createElement('label');
         label.textContent = lexicon[f] || f;
         const input = document.createElement('input');
         input.name = f;
         input.placeholder = f;
-        // par défaut tout en texte; l’API gère cat/num via son pipeline
+        input.autocomplete = 'off';
+        inputsMap[f] = input;
         const wrap = document.createElement('div');
         wrap.appendChild(label); wrap.appendChild(input);
         groups.appendChild(wrap);
       });
+      formDiv.innerHTML = "";
       formDiv.appendChild(groups);
-    });
+    }
 
-    // 2) Envoie la requête /score
-    btn.onclick = async () => {
-      const inputs = formDiv.querySelectorAll('input,select,textarea');
-      const payload = {};
-      inputs.forEach(i => {
-        // essaie de caster en nombre si possible
-        const v = i.value;
-        payload[i.name] = v === '' ? null : (isNaN(Number(v)) ? v : Number(v));
-      });
-      const res = await fetch('/score', {
-        method:'POST',
-        headers:{'Content-Type':'application/json'},
-        body: JSON.stringify({ payload })
-      });
-      const data = await res.json();
-      if (!res.ok) {
-        out.innerHTML = `<b>Erreur</b> : ${data.detail}`;
+    async function init(){
+      setStatus("Chargement du schéma…");
+      const r = await safeFetchJSON('/version');
+      if(!r.ok){
+        out.innerHTML = `<div class="error"><b>Erreur /version (${r.status})</b>\n${JSON.stringify(r.data,null,2)}</div>`;
+        setStatus("Échec du chargement du schéma.");
         return;
       }
-      const badge = data.decision === 'ACCEPT' ? 'ok' : 'ko';
-      const reasons = (data.top_factors || []).map(r => `<li>${r.feature} — <i>${r.effect}</i></li>`).join('');
-      out.innerHTML = `
-        <p><b>Probabilité de défaut:</b> ${(data.probability*100).toFixed(2)}%</p>
-        <p><b>Décision:</b> <span class="badge ${badge}">${data.decision}</span> (seuil=${data.threshold})</p>
-        <p><b>Top raisons:</b></p>
-        <ul>${reasons || '<li>(n/a)</li>'}</ul>
-      `;
+      buildForm(r.data);
+      setStatus("Schéma chargé.");
+    }
+
+    btnFill.onclick = () => {
+      // Exemple "ACCEPT" (correspond au Cas 1)
+      const sample = {
+        "checking_status": "0<=X<200",
+        "duration": 12,
+        "credit_history": "existing paid",
+        "purpose": "new car",
+        "credit_amount": 2000,
+        "savings_status": ">=1000",
+        "employment": ">=7",
+        "installment_commitment": 2,
+        "personal_status": "male single",
+        "other_parties": "none",
+        "residence_since": 4,
+        "property_magnitude": "real estate",
+        "age": 45,
+        "other_payment_plans": "none",
+        "housing": "own",
+        "existing_credits": 1,
+        "job": "skilled",
+        "num_dependents": 1,
+        "own_telephone": "yes",
+        "foreign_worker": "yes"
+      };
+      for(const f of features){
+        if(inputsMap[f]) inputsMap[f].value = (sample[f] ?? "");
+      }
+      out.textContent = "Exemple rempli. Clique sur Évaluer.";
     };
+
+    btnEval.onclick = async () => {
+      setStatus("Évaluation en cours…");
+      try{
+        // Construire le payload
+        const payload = {};
+        for(const f of features){
+          const el = inputsMap[f];
+          if(!el) continue;
+          const v = el.value;
+          payload[f] = v === '' ? null : (isNaN(Number(v)) ? v : Number(v));
+        }
+
+        const r = await safeFetchJSON('/score', {
+          method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body: JSON.stringify({ payload })
+        });
+
+        if(!r.ok){
+          out.innerHTML = `<div class="error"><b>Erreur /score (${r.status})</b>\n${JSON.stringify(r.data,null,2)}</div>`;
+          setStatus("Erreur");
+          return;
+        }
+
+        const data = r.data;
+        const badge = data.decision === 'ACCEPT' ? 'ok' : 'ko';
+        const reasons = (data.top_factors || []).map(r => `<li>${r.feature} — <i>${r.effect}</i></li>`).join('');
+        out.innerHTML = `
+          <p><b>Probabilité de défaut:</b> ${(data.probability*100).toFixed(2)}%</p>
+          <p><b>Décision:</b> <span class="badge ${badge}">${data.decision}</span> (seuil=${data.threshold})</p>
+          <p><b>Top raisons:</b></p>
+          <ul>${reasons || '<li>(n/a)</li>'}</ul>
+          <p class="muted">Version modèle: ${data.model_version}</p>
+        `;
+        setStatus("OK");
+      }catch(e){
+        out.innerHTML = `<div class="error"><b>Erreur JS</b>\n${String(e)}</div>`;
+        setStatus("Erreur");
+      }
+    };
+
+    init();
   </script>
 </body>
 </html>
