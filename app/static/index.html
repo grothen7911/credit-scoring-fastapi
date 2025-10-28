@@ -1,0 +1,87 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8" />
+  <title>Demo Scoring Crédit</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    fieldset { border: 1px solid #ddd; padding: 1rem; margin-bottom: 1rem; }
+    label { display:block; margin: .3rem 0 .1rem; font-weight:600 }
+    input, select { width: 100%; padding: .45rem; margin-bottom: .5rem; }
+    .row { display:grid; grid-template-columns: repeat(2,1fr); gap: 1rem; }
+    .result { padding: 1rem; border: 1px solid #eee; background: #fafafa; }
+    .badge { display:inline-block; padding:.2rem .5rem; border-radius:6px; }
+    .ok { background:#e6ffed; border:1px solid #b7f5c4; }
+    .ko { background:#ffecec; border:1px solid #ffc9c9; }
+    code { background:#f6f8fa; padding:.1rem .3rem; border-radius:4px; }
+  </style>
+</head>
+<body>
+  <h1>Scoring de crédit (demo)</h1>
+  <p>Remplis les champs puis clique sur <b>Évaluer</b>. Le seuil se configure côté serveur via <code>THRESHOLD</code>.</p>
+
+  <div id="form"></div>
+  <button id="btn">Évaluer</button>
+
+  <h2>Résultat</h2>
+  <div id="out" class="result">—</div>
+
+  <script>
+    const out = document.getElementById('out');
+    const formDiv = document.getElementById('form');
+    const btn = document.getElementById('btn');
+
+    // 1) Récupère la liste des features depuis l’API
+    let features = [];
+    let lexicon = {};
+    fetch('/version').then(r=>r.json()).then(meta => {
+      features = meta.features;
+      lexicon = meta.lexicon || {};
+      // construit un mini formulaire auto à partir des features
+      const groups = document.createElement('div'); groups.className = 'row';
+      features.forEach(f => {
+        const label = document.createElement('label');
+        label.textContent = lexicon[f] || f;
+        const input = document.createElement('input');
+        input.name = f;
+        input.placeholder = f;
+        // par défaut tout en texte; l’API gère cat/num via son pipeline
+        const wrap = document.createElement('div');
+        wrap.appendChild(label); wrap.appendChild(input);
+        groups.appendChild(wrap);
+      });
+      formDiv.appendChild(groups);
+    });
+
+    // 2) Envoie la requête /score
+    btn.onclick = async () => {
+      const inputs = formDiv.querySelectorAll('input,select,textarea');
+      const payload = {};
+      inputs.forEach(i => {
+        // essaie de caster en nombre si possible
+        const v = i.value;
+        payload[i.name] = v === '' ? null : (isNaN(Number(v)) ? v : Number(v));
+      });
+      const res = await fetch('/score', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({ payload })
+      });
+      const data = await res.json();
+      if (!res.ok) {
+        out.innerHTML = `<b>Erreur</b> : ${data.detail}`;
+        return;
+      }
+      const badge = data.decision === 'ACCEPT' ? 'ok' : 'ko';
+      const reasons = (data.top_factors || []).map(r => `<li>${r.feature} — <i>${r.effect}</i></li>`).join('');
+      out.innerHTML = `
+        <p><b>Probabilité de défaut:</b> ${(data.probability*100).toFixed(2)}%</p>
+        <p><b>Décision:</b> <span class="badge ${badge}">${data.decision}</span> (seuil=${data.threshold})</p>
+        <p><b>Top raisons:</b></p>
+        <ul>${reasons || '<li>(n/a)</li>'}</ul>
+      `;
+    };
+  </script>
+</body>
+</html>

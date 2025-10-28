@@ -1,0 +1,16 @@
+# API
+fastapi
+uvicorn
+
+# Core ML
+scikit-learn
+pandas
+numpy
+joblib
+
+# Dataset & explication
+openml
+shap
+
+# (optionnel) parsing rapide JSON
+orjson
