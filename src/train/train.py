@@ -10,14 +10,20 @@ Entraînement + tuning (CV) pour Credit Scoring (LogReg / XGBoost)
 - Calibration (isotonic si données suffisantes, sinon sigmoid)
 - Sélection de seuil sur validation interne (pas de fuite du test)
 - Export cv_results_ et artefacts versionnés (run_id)
+- MLflow : tracking (params, metrics), artefacts (csv/json), modèle (signature)
 """
 
+import os
 import argparse
 import json
 from pathlib import Path
 from typing import Tuple, Dict, Any
 from datetime import datetime
 import warnings
+
+import mlflow
+import mlflow.sklearn
+from mlflow.models.signature import infer_signature
 
 import numpy as np
 import pandas as pd
@@ -28,9 +34,7 @@ from sklearn.metrics import (
     roc_auc_score, precision_score, recall_score, f1_score,
     average_precision_score, precision_recall_curve
 )
-from sklearn.model_selection import (
-    train_test_split, StratifiedKFold
-)
+from sklearn.model_selection import train_test_split, StratifiedKFold
 
 # Activer les recherches "successives" (Halving*)
 from sklearn.experimental import enable_halving_search_cv  # noqa: F401
@@ -220,6 +224,10 @@ def main():
         X, y, test_size=args.test_size, stratify=y, random_state=args.random_state
     )
 
+    # === MLflow (minimal) ===
+    mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "file:./mlruns"))
+    mlflow.set_experiment(os.getenv("MLFLOW_EXPERIMENT_NAME", "credit-scoring"))
+
     # Ratio pour scale_pos_weight (XGB)
     pos_ratio = (y_tr == 1).mean()
     neg_ratio = 1 - pos_ratio
@@ -231,149 +239,198 @@ def main():
     # Choix des modèles à entraîner
     models = ["logreg", "xgb"] if args.model == "all" else [args.model]
 
-    # HalvingRandomSearchCV dans ta version sklearn ne supporte qu'une seule métrique en string
+    # HalvingRandomSearchCV : une seule métrique en string
     scoring_str = "average_precision" if args.refit_metric == "pr_auc" else "roc_auc"
 
-    # On va aussi calculer dynamiquement min_resources pour éviter ton erreur
-    # On prend ~10% des échantillons d'entraînement, min 50
+    # min_resources dynamique (~10% des échantillons, min 50)
     n_samples_train = X_tr.shape[0]
     min_resources_int = max(int(n_samples_train * 0.1), 50)
-    # si dataset est minuscule (<50), au pire on prend 1
     if min_resources_int > n_samples_train:
         min_resources_int = max(1, n_samples_train // 2)
 
     for m in models:
-        print(f"\n=== Tuning {m} (CV={args.cv}, Halving, refit={scoring_str}) ===")
+        with mlflow.start_run(run_name=m):
+            # Params globaux utiles
+            mlflow.log_param("model_type", m)
+            mlflow.log_param("cv_folds", args.cv)
+            mlflow.log_param("refit_metric", args.refit_metric)
+            mlflow.log_param("scoring_used", scoring_str)
+            mlflow.log_param("random_state", args.random_state)
+            mlflow.log_param("n_jobs", args.n_jobs)
+            mlflow.log_param("halving_min_resources", int(min_resources_int))
 
-        # pipeline + espace hyperparam
-        pipe, space = build_pipe_and_space(m, num_cols, cat_cols, args.random_state, args.n_jobs)
-        if m == "xgb":
-            space["clf__scale_pos_weight"] = [spw * f for f in (0.5, 1.0, 1.5, 2.0)]
+            print(f"\n=== Tuning {m} (CV={args.cv}, Halving, refit={scoring_str}) ===")
 
-        cv = StratifiedKFold(n_splits=args.cv, shuffle=True, random_state=args.random_state)
+            # pipeline + espace hyperparam
+            pipe, space = build_pipe_and_space(m, num_cols, cat_cols, args.random_state, args.n_jobs)
+            if m == "xgb":
+                space["clf__scale_pos_weight"] = [spw * f for f in (0.5, 1.0, 1.5, 2.0)]
 
-        # HalvingRandomSearchCV corrigé:
-        search = HalvingRandomSearchCV(
-            estimator=pipe,
-            param_distributions=space,
-            factor=3,
-            resource="n_samples",
-            max_resources="auto",
-            min_resources=min_resources_int,   # << ICI la correction
-            random_state=args.random_state,
-            scoring=scoring_str,
-            n_jobs=args.n_jobs,
-            cv=cv,
-            verbose=1,
-        )
+            cv = StratifiedKFold(n_splits=args.cv, shuffle=True, random_state=args.random_state)
 
-        search.fit(X_tr, y_tr)
+            # HalvingRandomSearchCV corrigé:
+            search = HalvingRandomSearchCV(
+                estimator=pipe,
+                param_distributions=space,
+                factor=3,
+                resource="n_samples",
+                max_resources="auto",
+                min_resources=min_resources_int,
+                random_state=args.random_state,
+                scoring=scoring_str,
+                n_jobs=args.n_jobs,
+                cv=cv,
+                verbose=1,
+            )
 
-        best_pipe: Pipeline = search.best_estimator_
-        best_params = to_json_safe(search.best_params_)
-        print(f"Best params ({m}): {best_params}")
-        print(f"Best CV {scoring_str.upper()}: {search.best_score_:.4f}")
+            search.fit(X_tr, y_tr)
 
-        # ==== Calibration ====
-        final_pipe = best_pipe
-        calib_method = None
-        if args.calibrate:
-            calib_method = choose_calibration_method(y_tr)
-            print(f"Calibration des probabilités ({calib_method}, cv=3)...")
-            final_pipe = CalibratedClassifierCV(estimator=best_pipe, method=calib_method, cv=3)
-            final_pipe.fit(X_tr, y_tr)
-        else:
-            final_pipe.fit(X_tr, y_tr)
+            best_pipe: Pipeline = search.best_estimator_
+            best_params = to_json_safe(search.best_params_)
+            print(f"Best params ({m}): {best_params}")
+            print(f"Best CV {scoring_str.upper()}: {search.best_score_:.4f}")
 
-        # ==== Sélection de seuil sur validation interne (20% de X_tr) ====
-        X_tune, X_thr, y_tune, y_thr = train_test_split(
-            X_tr, y_tr, test_size=0.2, stratify=y_tr, random_state=args.random_state
-        )
+            # log des meilleurs hyperparamètres
+            for k, v in best_params.items():
+                mlflow.log_param(k, v)
 
-        thr_pipe = clone(best_pipe)
-        if args.calibrate:
-            thr_pipe = CalibratedClassifierCV(estimator=thr_pipe, method=calib_method, cv=3)
-        thr_pipe.fit(X_tune, y_tune)
+            # ==== Calibration ====
+            final_pipe = best_pipe
+            calib_method = None
+            if args.calibrate:
+                calib_method = choose_calibration_method(y_tr)
+                mlflow.log_param("calibration_method", calib_method)
+                print(f"Calibration des probabilités ({calib_method}, cv=3)...")
+                final_pipe = CalibratedClassifierCV(estimator=best_pipe, method=calib_method, cv=3)
+                final_pipe.fit(X_tr, y_tr)
+            else:
+                final_pipe.fit(X_tr, y_tr)
 
-        proba_thr = thr_pipe.predict_proba(X_thr)[:, 1]
-        thr = best_threshold_by_f1(y_thr, proba_thr)
+            # ==== Sélection de seuil sur validation interne (20% de X_tr) ====
+            X_tune, X_thr, y_tune, y_thr = train_test_split(
+                X_tr, y_tr, test_size=0.2, stratify=y_tr, random_state=args.random_state
+            )
 
-        # ==== Évaluation hold-out ====
-        proba_te = final_pipe.predict_proba(X_te)[:, 1]
-        metrics = eval_metrics(y_te, proba_te, thr)
+            thr_pipe = clone(best_pipe)
+            if args.calibrate:
+                thr_pipe = CalibratedClassifierCV(estimator=thr_pipe, method=calib_method, cv=3)
+            thr_pipe.fit(X_tune, y_tune)
 
-        print(
-            f"Test ROC-AUC={metrics['auc']:.3f}  PR-AUC={metrics['pr_auc']:.3f}  "
-            f"F1={metrics['f1']:.3f}  Prec={metrics['precision']:.3f}  Rec={metrics['recall']:.3f}  "
-            f"(thr={metrics['threshold']:.3f})"
-        )
+            proba_thr = thr_pipe.predict_proba(X_thr)[:, 1]
+            thr = best_threshold_by_f1(y_thr, proba_thr)
 
-        # ==== Sauvegardes ====
-        suffix = "logreg" if m == "logreg" else "xgb"
-        model_fname = f"{run_id}_model_{suffix}.joblib"
-        model_path = ART / model_fname
-        dump(final_pipe, model_path)
+            # ==== Évaluation hold-out ====
+            proba_te = final_pipe.predict_proba(X_te)[:, 1]
+            metrics = eval_metrics(y_te, proba_te, thr)
 
-        # Export cv_results_ pour audit
-        cv_df = pd.DataFrame(search.cv_results_)
-        cv_csv_path = ART / f"{run_id}_cv_results_{suffix}.csv"
-        cv_df.to_csv(cv_csv_path, index=False)
+            # log métriques test + seuil
+            mlflow.log_metric("test_auc",       metrics["auc"])
+            mlflow.log_metric("test_pr_auc",    metrics["pr_auc"])
+            mlflow.log_metric("test_f1",        metrics["f1"])
+            mlflow.log_metric("test_precision", metrics["precision"])
+            mlflow.log_metric("test_recall",    metrics["recall"])
+            mlflow.log_metric("threshold_suggested", metrics["threshold"])
 
-        meta = {
-            "model": (
-                "LogisticRegression" if m == "logreg" else "XGBoost"
-            ) + (" (calibrated)" if args.calibrate else ""),
-            "version": "1.4.2",
-            "run_id": run_id,
-            "features": list(X.columns),
-            "num_cols": num_cols,
-            "cat_cols": cat_cols,
-            "metrics": metrics,
-            "threshold_suggested": thr,
-            "model_type": suffix,
-            "cv": args.cv,
-            "search": "HalvingRandomSearchCV",
-            "refit_metric": args.refit_metric,     # ce que tu as demandé via CLI
-            "scoring_used": scoring_str,           # string réellement utilisé pour Halving
-            "calibrated": bool(args.calibrate),
-            "calibration_method": calib_method,
-            "best_params": best_params,
-            "best_index": int(search.best_index_),
-            "cv_mean_score": float(search.best_score_),
-            "cv_csv": str(cv_csv_path),
-            "halving_min_resources": int(min_resources_int),
-            "lexicon": {
-                "duration":"Durée du crédit (mois)","credit_amount":"Montant du crédit","age":"Âge",
-                "credit_history":"Historique de crédit","checking_status":"Statut compte courant","savings_status":"Épargne",
-                "employment":"Ancienneté emploi","housing":"Logement","job":"Emploi (cat.)","purpose":"Objet du crédit",
-                "foreign_worker":"Travailleur étranger","installment_commitment":"Taux de mensualité / revenu",
-                "existing_credits":"Nb de crédits existants","residence_since":"Ancienneté de résidence",
-                "personal_status":"Statut personnel","other_parties":"Autres garants","other_payment_plans":"Autres plans",
-                "property_magnitude":"Patrimoine","num_dependents":"Personnes à charge","own_telephone":"Téléphone"
+            print(
+                f"Test ROC-AUC={metrics['auc']:.3f}  PR-AUC={metrics['pr_auc']:.3f}  "
+                f"F1={metrics['f1']:.3f}  Prec={metrics['precision']:.3f}  Rec={metrics['recall']:.3f}  "
+                f"(thr={metrics['threshold']:.3f})"
+            )
+
+            # --- Log du modèle au format MLflow (signature + exemple)
+            try:
+                input_example = X.head(5)
+                signature = infer_signature(input_example, final_pipe.predict_proba(input_example)[:, 1])
+                mlflow.sklearn.log_model(
+                    sk_model=final_pipe,
+                    artifact_path=f"model_{'logreg' if m=='logreg' else 'xgb'}",
+                    signature=signature,
+                    input_example=input_example,
+                    # Pour activer le Model Registry plus tard, décommente :
+                    # registered_model_name=os.getenv("MLFLOW_REGISTER_NAME", f"credit_scoring_{'logreg' if m=='logreg' else 'xgb'}")
+                )
+            except Exception as e:
+                print(f"[WARN] MLflow log_model a échoué: {e!r}")
+
+            # ==== Sauvegardes locales ====
+            suffix = "logreg" if m == "logreg" else "xgb"
+            model_fname = f"{run_id}_model_{suffix}.joblib"
+            model_path = ART / model_fname
+            dump(final_pipe, model_path)
+
+            # Export cv_results_ pour audit
+            cv_df = pd.DataFrame(search.cv_results_)
+            cv_csv_path = ART / f"{run_id}_cv_results_{suffix}.csv"
+            cv_df.to_csv(cv_csv_path, index=False)
+
+            meta = {
+                "model": (
+                    "LogisticRegression" if m == "logreg" else "XGBoost"
+                ) + (" (calibrated)" if args.calibrate else ""),
+                "version": "1.4.2",
+                "run_id": run_id,
+                "features": list(X.columns),
+                "num_cols": num_cols,
+                "cat_cols": cat_cols,
+                "metrics": metrics,
+                "threshold_suggested": thr,
+                "model_type": suffix,
+                "cv": args.cv,
+                "search": "HalvingRandomSearchCV",
+                "refit_metric": args.refit_metric,
+                "scoring_used": scoring_str,
+                "calibrated": bool(args.calibrate),
+                "calibration_method": calib_method,
+                "best_params": best_params,
+                "best_index": int(search.best_index_),
+                "cv_mean_score": float(search.best_score_),
+                "cv_csv": str(cv_csv_path),
+                "halving_min_resources": int(min_resources_int),
+                "mlflow": {
+                    "tracking_uri": mlflow.get_tracking_uri(),
+                    "experiment": os.getenv("MLFLOW_EXPERIMENT_NAME", "credit-scoring"),
+                    "run_id": mlflow.active_run().info.run_id
+                },
+                "lexicon": {
+                    "duration":"Durée du crédit (mois)","credit_amount":"Montant du crédit","age":"Âge",
+                    "credit_history":"Historique de crédit","checking_status":"Statut compte courant","savings_status":"Épargne",
+                    "employment":"Ancienneté emploi","housing":"Logement","job":"Emploi (cat.)","purpose":"Objet du crédit",
+                    "foreign_worker":"Travailleur étranger","installment_commitment":"Taux de mensualité / revenu",
+                    "existing_credits":"Nb de crédits existants","residence_since":"Ancienneté de résidence",
+                    "personal_status":"Statut personnel","other_parties":"Autres garants","other_payment_plans":"Autres plans",
+                    "property_magnitude":"Patrimoine","num_dependents":"Personnes à charge","own_telephone":"Téléphone"
+                }
             }
-        }
-        meta_path = ART / f"{run_id}_metadata_{suffix}.json"
-        meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
+            meta_path = ART / f"{run_id}_metadata_{suffix}.json"
+            meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-        # Explainer pour LR (non calibrée pour garder coef lisibles)
-        if m == "logreg":
-            expl_pipe = Pipeline([
-                ("pre", build_preproc(num_cols, cat_cols)),
-                ("clf", LogisticRegression(
-                    max_iter=5000, class_weight="balanced", solver="saga",
-                    C=best_params.get("clf__C", 1.0),
-                    penalty=best_params.get("clf__penalty", "l2"),
-                    l1_ratio=best_params.get("clf__l1_ratio", None),
-                    n_jobs=args.n_jobs,
-                    random_state=RANDOM_STATE_DEFAULT
-                ))
-            ])
-            # Fit global pour un explainer interprétable
-            expl_pipe.fit(pd.concat([X_tr, X_te]), np.concatenate([y_tr, y_te]))
-            dump(expl_pipe, ART / f"{run_id}_explainer_logreg.joblib")
+            # Log des artefacts dans MLflow (facilite l'audit)
+            try:
+                mlflow.log_artifact(str(cv_csv_path), artifact_path="artifacts")
+                mlflow.log_artifact(str(meta_path),    artifact_path="artifacts")
+            except Exception:
+                pass
 
-        print(f"✔︎ Sauvé : {model_path.name} + {meta_path.name} + {cv_csv_path.name}")
+            # Explainer pour LR (non calibrée pour garder coef lisibles)
+            if m == "logreg":
+                expl_pipe = Pipeline([
+                    ("pre", build_preproc(num_cols, cat_cols)),
+                    ("clf", LogisticRegression(
+                        max_iter=5000, class_weight="balanced", solver="saga",
+                        C=best_params.get("clf__C", 1.0),
+                        penalty=best_params.get("clf__penalty", "l2"),
+                        l1_ratio=best_params.get("clf__l1_ratio", None),
+                        n_jobs=args.n_jobs,
+                        random_state=RANDOM_STATE_DEFAULT
+                    ))
+                ])
+                # Fit global pour un explainer interprétable
+                expl_pipe.fit(pd.concat([X_tr, X_te]), np.concatenate([y_tr, y_te]))
+                dump(expl_pipe, ART / f"{run_id}_explainer_logreg.joblib")
 
+            print(f"✔︎ Sauvé : {model_path.name} + {meta_path.name} + {cv_csv_path.name}")
+
+    # Fin de la boucle
     print("\nTraining done ✅  (artifacts in artifacts/)")
     print("Disponibles :", ", ".join(sorted(p.name for p in ART.iterdir())))
 

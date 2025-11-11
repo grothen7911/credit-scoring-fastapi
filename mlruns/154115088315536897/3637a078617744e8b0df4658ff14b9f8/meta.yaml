@@ -1,0 +1,15 @@
+artifact_uri: file:///home/haytham/projects/credit-scoring-fastapi/mlruns/154115088315536897/3637a078617744e8b0df4658ff14b9f8/artifacts
+end_time: 1762879229214
+entry_point_name: ''
+experiment_id: '154115088315536897'
+lifecycle_stage: active
+run_id: 3637a078617744e8b0df4658ff14b9f8
+run_name: logreg
+run_uuid: 3637a078617744e8b0df4658ff14b9f8
+source_name: ''
+source_type: 4
+source_version: ''
+start_time: 1762879227010
+status: 3
+tags: []
+user_id: haytham
