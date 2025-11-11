@@ -1,167 +1,317 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="fr">
 <head>
-  <meta charset="UTF-8" />
-  <title>Demo Scoring Crédit</title>
+  <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Credit Scoring — Démo</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <meta name="color-scheme" content="light dark">
   <style>
-    body { font-family: system-ui, sans-serif; max-width: 1000px; margin: 2rem auto; padding: 0 1rem; }
-    fieldset { border: 1px solid #ddd; padding: 1rem; margin-bottom: 1rem; }
-    label { display:block; margin: .35rem 0 .15rem; font-weight:600 }
-    input, select { width: 100%; padding: .45rem; margin-bottom: .5rem; }
-    .row { display:grid; grid-template-columns: repeat(2,1fr); gap: 1rem; }
-    .result { padding: 1rem; border: 1px solid #eee; background: #fafafa; }
-    .badge { display:inline-block; padding:.2rem .5rem; border-radius:6px; }
-    .ok { background:#e6ffed; border:1px solid #b7f5c4; }
-    .ko { background:#ffecec; border:1px solid #ffc9c9; }
-    .muted { color:#666; font-size:.95rem }
-    .error { color:#b00020; white-space:pre-wrap }
-    .toolbar { display:flex; gap:.5rem; margin:.75rem 0 1rem }
+    .spin { animation: spin 1s linear infinite; }
+    @keyframes spin { from {transform: rotate(0)} to {transform: rotate(360deg)} }
+    code{word-break: break-word}
   </style>
 </head>
-<body>
-  <h1>Scoring de crédit (demo)</h1>
-  <p class="muted">Saisis les champs puis clique <b>Évaluer</b>. Le seuil se règle côté serveur via <code>THRESHOLD</code>.</p>
+<body class="bg-slate-50 text-slate-900">
+  <div class="max-w-6xl mx-auto p-4 sm:p-6">
+    <header class="mb-6">
+      <h1 class="text-2xl sm:text-3xl font-bold">Credit Scoring — Démonstration</h1>
+      <p class="text-sm text-slate-600">API FastAPI + modèle interprétable. Remplis le formulaire, ajuste le seuil, puis clique <em>Évaluer</em>.</p>
+    </header>
 
-  <div class="toolbar">
-    <button id="btn-fill">Remplir un exemple (ACCEPT)</button>
-    <button id="btn-eval">Évaluer</button>
-    <span id="status" class="muted"></span>
+    <!-- Bandeau infos modèle -->
+    <div id="modelInfo" class="mb-6 hidden rounded-xl border border-slate-200 bg-white p-4 text-sm"></div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <!-- Formulaire -->
+      <div class="lg:col-span-2">
+        <div class="rounded-xl border border-slate-200 bg-white p-4 sm:p-6">
+          <div class="flex items-center justify-between mb-4 gap-4">
+            <div>
+              <h2 class="font-semibold">Dossier client</h2>
+              <p class="text-xs text-slate-500">Champs requis par le modèle</p>
+            </div>
+            <div class="flex gap-2">
+              <button id="btnGood" class="px-3 py-1.5 text-xs rounded-lg border border-emerald-300 text-emerald-800 bg-emerald-50 hover:bg-emerald-100">Cas “bon payeur”</button>
+              <button id="btnRisk" class="px-3 py-1.5 text-xs rounded-lg border border-rose-300 text-rose-800 bg-rose-50 hover:bg-rose-100">Cas “à risque”</button>
+            </div>
+          </div>
+
+          <form id="scoreForm" class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <!-- champs générés par JS -->
+          </form>
+
+          <!-- Seuil -->
+          <div class="mt-6">
+            <label class="text-sm font-medium">Seuil de décision <span id="thrVal" class="font-mono"></span></label>
+            <input id="threshold" type="range" min="0.01" max="0.5" step="0.01"
+                   class="w-full accent-indigo-600">
+            <p class="text-xs text-slate-500 mt-1">Décision = <code>ACCEPT</code> si proba &lt; seuil ; sinon <code>REFUSE</code>.</p>
+          </div>
+
+          <!-- Actions -->
+          <div class="mt-6 flex flex-wrap gap-3">
+            <button id="btnEval" class="px-4 py-2 rounded-lg bg-indigo-600 text-white hover:bg-indigo-700 disabled:opacity-60 disabled:cursor-not-allowed">
+              <span class="inline-flex items-center gap-2">
+                <svg id="spin" class="hidden w-4 h-4 spin" viewBox="0 0 24 24"><circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" fill="none"/></svg>
+                Évaluer
+              </span>
+            </button>
+            <button id="btnCopy" type="button" class="px-4 py-2 rounded-lg border border-slate-300 hover:bg-slate-50">Copier le payload JSON</button>
+            <a href="/docs" target="_blank" class="px-4 py-2 rounded-lg border border-slate-300 hover:bg-slate-50">Swagger /docs</a>
+          </div>
+
+          <!-- Zone d’erreur -->
+          <div id="err" class="hidden mt-4 rounded-lg border border-rose-200 bg-rose-50 p-3 text-sm text-rose-800"></div>
+        </div>
+      </div>
+
+      <!-- Résultat -->
+      <div>
+        <div class="rounded-xl border border-slate-200 bg-white p-4 sm:p-6">
+          <h3 class="font-semibold mb-3">Résultat</h3>
+          <div id="resultCard" class="space-y-3">
+            <p class="text-sm text-slate-500">Aucun résultat pour l’instant.</p>
+          </div>
+        </div>
+
+        <!-- Journal léger (optionnel) -->
+        <div class="rounded-xl border border-slate-200 bg-white p-4 sm:p-6 mt-6">
+          <h4 class="font-semibold mb-2">Dernier payload</h4>
+          <pre id="payloadBox" class="text-xs bg-slate-50 p-3 rounded-lg overflow-x-auto"></pre>
+        </div>
+      </div>
+    </div>
   </div>
 
-  <div id="form"></div>
-
-  <h2>Résultat</h2>
-  <div id="out" class="result">—</div>
-
   <script>
-    const out = document.getElementById('out');
-    const formDiv = document.getElementById('form');
-    const btnEval = document.getElementById('btn-eval');
-    const btnFill = document.getElementById('btn-fill');
-    const statusEl = document.getElementById('status');
+    // --- Valeurs catégorielles connues (German Credit) ---
+    const CATS = {
+      checking_status: ["<0","0<=X<200",">=200","no checking"],
+      credit_history: ["no credits/all paid","all paid","existing paid","delayed previously","critical/other existing credit"],
+      purpose: ["radio/tv","education","furniture/equipment","new car","used car","business","domestic appliance","repairs","vacation","retraining","other"],
+      savings_status: ["no known savings","<100","100<=X<500","500<=X<1000",">=1000"],
+      employment: ["unemployed","<1","1<=X<4","4<=X<7",">=7"],
+      personal_status: ["male div/sep","female div/dep/mar","male single","male mar/wid"],
+      other_parties: ["none","co applicant","guarantor"],
+      property_magnitude: ["real estate","life insurance","car","no known property"],
+      other_payment_plans: ["none","bank","stores"],
+      housing: ["rent","own","for free"],
+      job: ["unemployed non-resident","unskilled resident","skilled","high qualif/self emp/mgmt"],
+      own_telephone: ["none","yes"],
+      foreign_worker: ["yes","no"]
+    };
 
-    let features = [];
-    let lexicon = {};
-    let inputsMap = {}; // name -> input element
+    // Champs numériques attendus
+    const NUMS = ["duration","credit_amount","installment_commitment","residence_since","age","existing_credits","num_dependents"];
 
-    function setStatus(msg){ statusEl.textContent = msg || ""; }
+    // État global
+    let META = null;
 
-    async function safeFetchJSON(url, options){
-      try{
-        const res = await fetch(url, options);
-        const text = await res.text();
-        let data;
-        try { data = JSON.parse(text); } catch(e){ data = { raw: text }; }
-        return { ok: res.ok, status: res.status, data };
-      }catch(err){
-        return { ok: false, status: 0, data: { error: String(err) } };
+    const $ = (id)=>document.getElementById(id);
+
+    function badge(decision){
+      const ok = decision === "ACCEPT";
+      const cls = ok ? "bg-emerald-50 text-emerald-700 border-emerald-200"
+                     : "bg-rose-50 text-rose-700 border-rose-200";
+      const txt = ok ? "ACCEPT" : "REFUSE";
+      return `<span class="inline-block px-2 py-0.5 text-xs rounded-lg border ${cls} font-semibold">${txt}</span>`;
+    }
+
+    function percent(p){ return (p*100).toFixed(2) + " %"; }
+
+    function setError(msg){
+      const box = $("err");
+      if(!msg){ box.classList.add("hidden"); box.textContent = ""; return; }
+      box.textContent = msg;
+      box.classList.remove("hidden");
+    }
+
+    function setPayloadBox(obj){
+      $("payloadBox").textContent = JSON.stringify(obj, null, 2);
+    }
+
+    function buildField(key, label){
+      if (CATS[key]) {
+        return `
+          <label class="block text-sm font-medium">${label}</label>
+          <select name="${key}" class="w-full mt-1 rounded-md border border-slate-300 px-3 py-2 bg-white">
+            ${CATS[key].map(v=>`<option>${v}</option>`).join("")}
+          </select>
+        `;
       }
+      const minMax = {
+        duration: [1,72], credit_amount:[100,20000], installment_commitment:[1,10],
+        residence_since:[1,10], age:[18,90], existing_credits:[0,5], num_dependents:[0,3]
+      }[key] || [0, 1000000];
+      return `
+        <label class="block text-sm font-medium">${label}</label>
+        <input name="${key}" type="number" step="1" min="${minMax[0]}" max="${minMax[1]}"
+               class="w-full mt-1 rounded-md border border-slate-300 px-3 py-2 bg-white" required>
+      `;
     }
 
     function buildForm(meta){
-      features = meta.features || [];
-      lexicon = meta.lexicon || {};
-      const groups = document.createElement('div'); groups.className = 'row';
-      inputsMap = {};
-      features.forEach(f => {
-        const label = document.createElement('label');
-        label.textContent = lexicon[f] || f;
-        const input = document.createElement('input');
-        input.name = f;
-        input.placeholder = f;
-        input.autocomplete = 'off';
-        inputsMap[f] = input;
-        const wrap = document.createElement('div');
-        wrap.appendChild(label); wrap.appendChild(input);
-        groups.appendChild(wrap);
+      const form = $("scoreForm");
+      form.innerHTML = "";
+      const cols = meta.features;
+      const labels = meta.lexicon || {};
+      cols.forEach((k)=>{
+        const label = labels[k] || k;
+        const wrapper = document.createElement("div");
+        wrapper.innerHTML = buildField(k, label);
+        form.appendChild(wrapper);
       });
-      formDiv.innerHTML = "";
-      formDiv.appendChild(groups);
+      // Valeurs par défaut raisonnables
+      const defaults = {
+        checking_status:"<0", duration:12, credit_history:"existing paid", purpose:"radio/tv",
+        credit_amount:1500, savings_status:"<100", employment:"1<=X<4",
+        installment_commitment:3, personal_status:"male single", other_parties:"none",
+        residence_since:3, property_magnitude:"car", age:35,
+        other_payment_plans:"none", housing:"rent", existing_credits:1, job:"skilled",
+        num_dependents:0, own_telephone:"none", foreign_worker:"yes"
+      };
+      Object.entries(defaults).forEach(([k,v])=>{
+        const el = form.querySelector(`[name="${k}"]`);
+        if(el) el.value = v;
+      });
+    }
+
+    function payloadFromForm(){
+      const form = $("scoreForm");
+      const data = {};
+      [...new FormData(form).entries()].forEach(([k,v])=>{
+        data[k] = NUMS.includes(k) ? Number(v) : v;
+      });
+      return { payload: data };
+    }
+
+    async function fetchMeta(){
+      const r = await fetch("/version");
+      if(!r.ok) throw new Error("Impossible de charger /version");
+      return r.json();
+    }
+
+    function updateModelInfo(meta){
+      const box = $("modelInfo");
+      const m = meta.model || "—";
+      const ver = meta.version || "—";
+      const thr = (meta.threshold_suggested ?? 0.05);
+      box.innerHTML = `
+        <div class="flex items-start justify-between gap-4">
+          <div>
+            <div class="font-medium">Modèle</div>
+            <div class="text-sm text-slate-600">${m}</div>
+            <div class="text-xs text-slate-500 mt-1">Version : <code>${ver}</code> — Seuil suggéré : <code>${thr}</code></div>
+          </div>
+          <a class="text-xs underline text-indigo-700 hover:text-indigo-900" href="/docs" target="_blank" title="Documentation interactive Swagger de votre API">
+            Swagger /docs
+          </a>
+        </div>
+      `;
+      box.classList.remove("hidden");
+      const slider = $("threshold");
+      slider.value = String(thr);
+      $("thrVal").textContent = "(" + Number(slider.value).toFixed(2) + ")";
+    }
+
+    function setThresholdLabel(){
+      $("thrVal").textContent = "(" + Number($("threshold").value).toFixed(2) + ")";
+    }
+
+    function fillGood(){
+      const form = $("scoreForm");
+      const good = {
+        checking_status:"no checking", duration:12, credit_history:"all paid",
+        purpose:"education", credit_amount:800, savings_status:">=1000",
+        employment:">=7", installment_commitment:1, personal_status:"male mar/wid",
+        other_parties:"none", residence_since:6, property_magnitude:"real estate",
+        age:45, other_payment_plans:"none", housing:"own", existing_credits:1,
+        job:"skilled", num_dependents:0, own_telephone:"yes", foreign_worker:"no"
+      };
+      Object.entries(good).forEach(([k,v])=>{ const el=form.querySelector(`[name="${k}"]`); if(el) el.value=v; });
+    }
+
+    function fillRisk(){
+      const form = $("scoreForm");
+      const risk = {
+        checking_status:"<0", duration:48, credit_history:"critical/other existing credit",
+        purpose:"vacation", credit_amount:8000, savings_status:"no known savings",
+        employment:"unemployed", installment_commitment:5, personal_status:"male single",
+        other_parties:"none", residence_since:1, property_magnitude:"no known property",
+        age:22, other_payment_plans:"bank", housing:"rent", existing_credits:3,
+        job:"unskilled resident", num_dependents:2, own_telephone:"none", foreign_worker:"yes"
+      };
+      Object.entries(risk).forEach(([k,v])=>{ const el=form.querySelector(`[name="${k}"]`); if(el) el.value=v; });
+    }
+
+    async function evaluate(){
+      setError("");
+      const btn = $("btnEval"); const spinner = $("spin");
+      btn.disabled = true; spinner.classList.remove("hidden");
+      try{
+        const thr = Number($("threshold").value);
+        // On fixe le seuil côté serveur via variable d'env ; ici on l’affiche juste.
+        const payload = payloadFromForm();
+        setPayloadBox(payload);
+
+        const r = await fetch("/score", {
+          method: "POST",
+          headers: {"Content-Type":"application/json"},
+          body: JSON.stringify(payload)
+        });
+        if(!r.ok){
+          const msg = await r.text();
+          throw new Error(msg || ("HTTP " + r.status));
+        }
+        const out = await r.json();
+
+        // Rendu résultat
+        const card = $("resultCard");
+        card.innerHTML = `
+          <div class="flex items-center justify-between">
+            <div class="text-sm text-slate-500">Probabilité de défaut</div>
+            <div class="text-xl font-semibold">${percent(out.probability)}</div>
+          </div>
+          <div class="flex items-center justify-between">
+            <div class="text-sm text-slate-500">Décision (seuil ${Number(thr).toFixed(2)})</div>
+            <div>${badge(out.decision)}</div>
+          </div>
+          <div>
+            <div class="text-sm font-medium mb-1">Top raisons (langage métier)</div>
+            <ul class="list-disc ml-5 text-sm text-slate-700">
+              ${ (out.top_factors||[]).map(f=>`<li><b>${f.feature}</b> — ${f.effect}</li>`).join("") || "<li>—</li>" }
+            </ul>
+          </div>
+          <div class="text-xs text-slate-500">Modèle : <code>${out.model_version || (META?.version ?? "—")}</code></div>
+        `;
+      }catch(e){
+        setError(e.message || String(e));
+      }finally{
+        btn.disabled = false; spinner.classList.add("hidden");
+      }
     }
 
     async function init(){
-      setStatus("Chargement du schéma…");
-      const r = await safeFetchJSON('/version');
-      if(!r.ok){
-        out.innerHTML = `<div class="error"><b>Erreur /version (${r.status})</b>\n${JSON.stringify(r.data,null,2)}</div>`;
-        setStatus("Échec du chargement du schéma.");
-        return;
-      }
-      buildForm(r.data);
-      setStatus("Schéma chargé.");
-    }
-
-    btnFill.onclick = () => {
-      // Exemple "ACCEPT" (correspond au Cas 1)
-      const sample = {
-        "checking_status": "0<=X<200",
-        "duration": 12,
-        "credit_history": "existing paid",
-        "purpose": "new car",
-        "credit_amount": 2000,
-        "savings_status": ">=1000",
-        "employment": ">=7",
-        "installment_commitment": 2,
-        "personal_status": "male single",
-        "other_parties": "none",
-        "residence_since": 4,
-        "property_magnitude": "real estate",
-        "age": 45,
-        "other_payment_plans": "none",
-        "housing": "own",
-        "existing_credits": 1,
-        "job": "skilled",
-        "num_dependents": 1,
-        "own_telephone": "yes",
-        "foreign_worker": "yes"
-      };
-      for(const f of features){
-        if(inputsMap[f]) inputsMap[f].value = (sample[f] ?? "");
-      }
-      out.textContent = "Exemple rempli. Clique sur Évaluer.";
-    };
-
-    btnEval.onclick = async () => {
-      setStatus("Évaluation en cours…");
       try{
-        // Construire le payload
-        const payload = {};
-        for(const f of features){
-          const el = inputsMap[f];
-          if(!el) continue;
-          const v = el.value;
-          payload[f] = v === '' ? null : (isNaN(Number(v)) ? v : Number(v));
-        }
-
-        const r = await safeFetchJSON('/score', {
-          method:'POST',
-          headers:{'Content-Type':'application/json'},
-          body: JSON.stringify({ payload })
-        });
-
-        if(!r.ok){
-          out.innerHTML = `<div class="error"><b>Erreur /score (${r.status})</b>\n${JSON.stringify(r.data,null,2)}</div>`;
-          setStatus("Erreur");
-          return;
-        }
-
-        const data = r.data;
-        const badge = data.decision === 'ACCEPT' ? 'ok' : 'ko';
-        const reasons = (data.top_factors || []).map(r => `<li>${r.feature} — <i>${r.effect}</i></li>`).join('');
-        out.innerHTML = `
-          <p><b>Probabilité de défaut:</b> ${(data.probability*100).toFixed(2)}%</p>
-          <p><b>Décision:</b> <span class="badge ${badge}">${data.decision}</span> (seuil=${data.threshold})</p>
-          <p><b>Top raisons:</b></p>
-          <ul>${reasons || '<li>(n/a)</li>'}</ul>
-          <p class="muted">Version modèle: ${data.model_version}</p>
-        `;
-        setStatus("OK");
+        META = await fetchMeta();
+        buildForm(META);
+        updateModelInfo(META);
+        setPayloadBox(payloadFromForm());
       }catch(e){
-        out.innerHTML = `<div class="error"><b>Erreur JS</b>\n${String(e)}</div>`;
-        setStatus("Erreur");
+        setError("Impossible de charger la configuration du modèle (/version). Démarre l’API ou vérifie les artefacts.");
       }
-    };
+      $("threshold").addEventListener("input", setThresholdLabel);
+      $("btnEval").addEventListener("click", (ev)=>{ ev.preventDefault(); evaluate(); });
+      $("btnCopy").addEventListener("click", ()=>{
+        const text = $("payloadBox").textContent;
+        navigator.clipboard.writeText(text);
+      });
+      $("btnGood").addEventListener("click", (ev)=>{ ev.preventDefault(); fillGood(); setPayloadBox(payloadFromForm()); });
+      $("btnRisk").addEventListener("click", (ev)=>{ ev.preventDefault(); fillRisk(); setPayloadBox(payloadFromForm()); });
+      $("scoreForm").addEventListener("change", ()=> setPayloadBox(payloadFromForm()));
+      $("scoreForm").addEventListener("keyup", ()=> setPayloadBox(payloadFromForm()));
+    }
 
     init();
   </script>
